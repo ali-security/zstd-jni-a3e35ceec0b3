@@ -922,6 +922,19 @@ class ZstdSpec extends AnyFlatSpec with ScalaCheckPropertyChecks {
     }
   }
 
+  "ZstdOutputStream" should s"throw on setting checksum on closed stream" in {
+    val os  = new ByteArrayOutputStream(100)
+    val zos = new ZstdOutputStreamNoFinalizer(os, 1)
+    zos.setCloseFrameOnFlush(true)
+    zos.write("foo".toArray.map(_.toByte))
+    // closes the frame, so the closed stream does not report a frame in progress
+    zos.flush()
+    zos.close()
+    assertThrows[IOException] {
+      zos.setChecksum(true)
+    }
+  }
+
   "ZstdDirectBufferCompressingStream" should s"do nothing on double close but throw on writing on closed stream" in {
     val os  = ByteBuffer.allocateDirect(100)
     val zos = new ZstdDirectBufferCompressingStream(os, 1)
