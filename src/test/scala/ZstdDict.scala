@@ -427,6 +427,112 @@ class ZstdDictSpec extends AnyFlatSpec {
       zis.close
       assert(input.toSeq == output.toSeq)
     }
+
+    def readFully(zis: InputStream, size: Int): Array[Byte] = {
+      val output = Array.fill[Byte](size)(0)
+      var ptr = 0
+      while (ptr < size) {
+        val read = zis.read(output, ptr, size - ptr)
+        assert(read > 0)
+        ptr += read
+      }
+      output
+    }
+
+    it should s"not free a fast dict while ZstdInputStream uses it with legacy $legacy" in {
+      val compressed = Zstd.compressUsingDict(input, dict, 1)
+      val ddict = new ZstdDictDecompress(dict)
+      val zis = new ZstdInputStreamNoFinalizer(new ByteArrayInputStream(compressed))
+      zis.setDict(ddict)
+      // the stream references the native dictionary, closing it would leave a dangling pointer
+      val e = intercept[IllegalStateException] {
+        ddict.close()
+      }
+      assert(e.getMessage == "Attempt to close while in use")
+      val output = readFully(zis, input.length)
+      zis.close()
+      assert(input.toSeq == output.toSeq)
+      // closing the stream releases the dictionary
+      ddict.close()
+    }
+
+    it should s"release the previous fast dict and failed fast dicts in ZstdInputStream with legacy $legacy" in {
+      val compressed = Zstd.compressUsingDict(input, dict, 1)
+      val ddict = new ZstdDictDecompress(dict)
+      val ddict2 = new ZstdDictDecompress(dict2)
+      val zis = new ZstdInputStreamNoFinalizer(new ByteArrayInputStream(compressed))
+      zis.setDict(ddict2)
+      zis.setDict(ddict)
+      // the replaced dictionary is not in use anymore
+      ddict2.close()
+      intercept[IllegalStateException] {
+        ddict.close()
+      }
+      // advance into the frame, so loading a dictionary now fails
+      val head = readFully(zis, 16)
+      val ddict3 = new ZstdDictDecompress(dict2)
+      intercept[ZstdIOException] {
+        zis.setDict(ddict3)
+      }
+      // a dictionary that failed to load is not retained
+      ddict3.close()
+      val rest = readFully(zis, input.length - 16)
+      zis.close()
+      assert(input.toSeq == (head ++ rest).toSeq)
+      ddict.close()
+    }
+
+    it should s"not free a fast dict while ZstdOutputStream uses it with legacy $legacy" in {
+      val cdict = new ZstdDictCompress(dict, 0, dict.length, 1)
+      val cdict2 = new ZstdDictCompress(dict2, 0, dict2.length, 1)
+      val os = new ByteArrayOutputStream(Zstd.compressBound(input.length.toLong).toInt)
+      val zos = new ZstdOutputStreamNoFinalizer(os, 1)
+      zos.setDict(cdict2)
+      zos.setDict(cdict)
+      // the replaced dictionary is not in use anymore
+      cdict2.close()
+      // the stream references the native dictionary, closing it would leave a dangling pointer
+      val e = intercept[IllegalStateException] {
+        cdict.close()
+      }
+      assert(e.getMessage == "Attempt to close while in use")
+      zos.write(input)
+      zos.close()
+      // closing the stream releases the dictionary
+      cdict.close()
+      val compressed = os.toByteArray
+      assert(Zstd.getDictIdFromFrame(compressed) == Zstd.getDictIdFromDict(dict))
+      assert(input.toSeq == Zstd.decompress(compressed, dict, input.length).toSeq)
+    }
+
+    it should s"not free a fast dict while ZstdBufferDecompressingStream uses it with legacy $legacy" in {
+      val compressed = Zstd.compressUsingDict(input, dict, 1)
+      val ddict = new ZstdDictDecompress(dict)
+      val ddict2 = new ZstdDictDecompress(dict2)
+      val zis = new ZstdBufferDecompressingStreamNoFinalizer(ByteBuffer.wrap(compressed))
+      zis.setDict(ddict2)
+      zis.setDict(ddict)
+      // the replaced dictionary is not in use anymore
+      ddict2.close()
+      // the stream references the native dictionary, closing it would leave a dangling pointer
+      val e = intercept[IllegalStateException] {
+        ddict.close()
+      }
+      assert(e.getMessage == "Attempt to close while in use")
+      val output = ByteBuffer.allocate(input.length)
+      val block = ByteBuffer.allocate(128 * 1024)
+      while (zis.hasRemaining) {
+        block.clear()
+        zis.read(block)
+        block.flip()
+        output.put(block)
+      }
+      zis.close()
+      assert(!zis.hasRemaining)
+      assert(input.toSeq == output.array.toSeq)
+      // closing the stream releases the dictionary
+      ddict.close()
+    }
   }
 
   val boundsDict = input.slice(0, 16 * 1024)
